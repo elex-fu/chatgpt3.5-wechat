@@ -3,15 +3,22 @@
 from bot.bot import Bot
 from config import conf
 from common.log import logger
+from common.expired_dict import ExpiredDict
 import openai
 import time
 
-user_session = dict()
+if conf().get('expires_in_seconds'):
+    user_session = ExpiredDict(conf().get('expires_in_seconds'))
+else:
+    user_session = dict()
 
 # OpenAI对话模型API (可用)
 class ChatGPTBot(Bot):
     def __init__(self):
         openai.api_key = conf().get('open_ai_api_key')
+        proxy = conf().get('proxy')
+        if proxy:
+            openai.proxy = proxy
 
     def reply(self, query, context=None):
         # acquire reply content
@@ -21,6 +28,9 @@ class ChatGPTBot(Bot):
             if query == '#清除记忆':
                 Session.clear_session(from_user_id)
                 return '记忆已清除'
+            elif query == '#清除所有':
+                Session.clear_all_session()
+                return '所有人记忆已清除'            
 
             new_query = Session.build_session_query(query, from_user_id)
             logger.debug("[OPEN_AI] session query={}".format(new_query))
@@ -30,29 +40,36 @@ class ChatGPTBot(Bot):
             #     return self.reply_text_stream(query, new_query, from_user_id)
 
             reply_content = self.reply_text(new_query, from_user_id, 0)
-            logger.debug("[OPEN_AI] new_query={}, user={}, reply_cont={}".format(new_query, from_user_id, reply_content))
-            if reply_content:
-                Session.save_session(query, reply_content, from_user_id)
-            return reply_content
+            logger.debug("[OPEN_AI] new_query={}, user={}, reply_cont={}".format(new_query, from_user_id, reply_content["content"]))
+            if reply_content["completion_tokens"] > 0:
+                Session.save_session(reply_content["content"], from_user_id, reply_content["total_tokens"])
+            return reply_content["content"]
 
         elif context.get('type', None) == 'IMAGE_CREATE':
             return self.create_img(query, 0)
 
-    def reply_text(self, query, user_id, retry_count=0):
+    def reply_text(self, query, user_id, retry_count=0) ->dict:
+        '''
+        call openai's ChatCompletion to get the answer
+        :param query: query content
+        :param user_id: from user id
+        :param retry_count: retry count
+        :return: {}
+        '''
         try:
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",  # 对话模型的名称
                 messages=query,
                 temperature=0.9,  # 值在[0,1]之间，越大表示回复越具有不确定性
-                max_tokens=1200,  # 回复最大的字符数
+                #max_tokens=4096,  # 回复最大的字符数
                 top_p=1,
                 frequency_penalty=0.0,  # [-2,2]之间，该值越大则更倾向于产生不同的内容
                 presence_penalty=0.0,  # [-2,2]之间，该值越大则更倾向于产生不同的内容
             )
-            # res_content = response.choices[0]['text'].strip().replace('<|endoftext|>', '')
-            logger.info(response.choices[0]['message']['content'])
-            # log.info("[OPEN_AI] reply={}".format(res_content))
-            return response.choices[0]['message']['content']
+            logger.info("[ChatGPT] reply={}, total_tokens={}".format(response.choices[0]['message']['content'], response["usage"]["total_tokens"]))
+            return {"total_tokens": response["usage"]["total_tokens"], 
+                    "completion_tokens": response["usage"]["completion_tokens"], 
+                    "content": response.choices[0]['message']['content']}
         except openai.error.RateLimitError as e:
             # rate limit exception
             logger.warn(e)
@@ -61,12 +78,21 @@ class ChatGPTBot(Bot):
                 logger.warn("[OPEN_AI] RateLimit exceed, 第{}次重试".format(retry_count+1))
                 return self.reply_text(query, user_id, retry_count+1)
             else:
-                return "提问太快啦，请休息一下再问我吧"
+                return {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
+        except openai.error.APIConnectionError as e:
+            # api connection exception
+            logger.warn(e)
+            logger.warn("[OPEN_AI] APIConnection failed")
+            return {"completion_tokens": 0, "content":"我连接不到你的网络"}
+        except openai.error.Timeout as e:
+            logger.warn(e)
+            logger.warn("[OPEN_AI] Timeout")
+            return {"completion_tokens": 0, "content":"我没有收到你的消息"}
         except Exception as e:
             # unknown exception
             logger.exception(e)
             Session.clear_session(user_id)
-            return "请再问我一次吧"
+            return {"completion_tokens": 0, "content": "请再问我一次吧"}
 
     def create_img(self, query, retry_count=0):
         try:
@@ -117,14 +143,40 @@ class Session(object):
         return session
 
     @staticmethod
-    def save_session(query, answer, user_id):
+    def save_session(answer, user_id, total_tokens):
+        max_tokens = conf().get("conversation_max_tokens")
+        if not max_tokens:
+            # default 3000
+            max_tokens = 1000
+        max_tokens=int(max_tokens)
+
         session = user_session.get(user_id)
         if session:
             # append conversation
             gpt_item = {'role': 'assistant', 'content': answer}
             session.append(gpt_item)
 
+        # discard exceed limit conversation
+        Session.discard_exceed_conversation(session, max_tokens, total_tokens)
+    
+
+    @staticmethod
+    def discard_exceed_conversation(session, max_tokens, total_tokens):
+        dec_tokens = int(total_tokens)
+        # logger.info("prompt tokens used={},max_tokens={}".format(used_tokens,max_tokens))
+        while dec_tokens > max_tokens:
+            # pop first conversation
+            if len(session) > 3:
+                session.pop(1)
+                session.pop(1)
+            else:
+                break    
+            dec_tokens = dec_tokens - max_tokens
+
     @staticmethod
     def clear_session(user_id):
         user_session[user_id] = []
 
+    @staticmethod
+    def clear_all_session():
+        user_session.clear()
