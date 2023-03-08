@@ -2,7 +2,6 @@
 
 import json
 import os
-from common.log import logger
 
 config = {}
 
@@ -16,9 +15,6 @@ def load_config():
     config_str = read_file(config_path)
     # 将json字符串反序列化为dict类型
     config = json.loads(config_str)
-    logger.info("[INIT] load config: {}".format(config))
-
-
 
 def get_root():
     return os.path.dirname(os.path.abspath( __file__ ))
@@ -31,3 +27,27 @@ def read_file(path):
 
 def conf():
     return config
+
+
+def model_conf(model_type):
+    return config.get('model').get(model_type)
+
+def model_conf_val(model_type, key):
+    val = config.get('model').get(model_type).get(key)
+    if not val:
+        # common default config
+        return config.get('model').get(key)
+    return val
+
+
+def channel_conf(channel_type):
+    return config.get('channel').get(channel_type)
+
+
+def channel_conf_val(channel_type, key, default=None):
+    val = config.get('channel').get(channel_type).get(key)
+    if not val:
+        # common default config
+        return config.get('channel').get(key, default)
+    return val
+ 
